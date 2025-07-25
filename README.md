@@ -4,4 +4,4 @@ on https:
 
 
 
-python httpsSlowloris.py --host example.com #now http or later part of the url needed
+python httpsSlowloris.py --host example.com #no https or later part of the url needed
