@@ -1,0 +1,2 @@
+to check response time: watch -n2 "curl -o /dev/null -s -w '%{time_total}\n' https://cse.buet.ac.bd"
+to  get valid response: curl -I https://cse.buet.ac.bd

