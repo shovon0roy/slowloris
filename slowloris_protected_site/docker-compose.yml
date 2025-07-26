@@ -1,0 +1,9 @@
+version: "3.9"
+
+services:
+  web:
+    build: ./apache
+    container_name: slowloris-demo
+    ports:
+      - "8080:80"
+    restart: unless-stopped
